@@ -1,0 +1,1351 @@
+
+
+create or replace PACKAGE BODY C_BANK_STATEMENT_INT_API IS
+
+  -----------------------------------------------------------------------------
+  --------------------------------- TAG ---------------------------------------
+  -----------------------------------------------------------------------------
+  /*
+  Code: OLA#1789780
+  Date: 08/02/2023
+  User: JMF
+  Version: 001
+  Observation:
+  
+  ------
+  
+  Code:
+  Date: 01/02/2024
+  User: JMF
+  Version: 002
+  Observation: Chang date format mask, in order to prevent error on
+  bank transfer files because os the mask yyyy-mm-dd to solve that we put dd-mm-yyyy
+  
+  */
+
+  -----------------------------------------------------------------------------
+  -------------------- GLOBAL LU CONSTANTS ------------------------------------
+  -----------------------------------------------------------------------------
+
+  -----------------------------------------------------------------------------
+  -------------------- IMPLEMENTATION METHOD DECLARATIONS ---------------------
+  -----------------------------------------------------------------------------
+
+  FUNCTION Check_Bank_Statement_files(str IN VARCHAR2) RETURN VARCHAR2 AS
+    LANGUAGE JAVA NAME 'CBankStatementIntUtility.getBankStmtList(java.lang.String) return java.lang.String';
+
+  PROCEDURE writelog(p_msg      VARCHAR2,
+                     i          NUMBER default NULL,
+                     v_filename varchar2 default NULL) IS
+                     
+  BEGIN
+    IF (Object_Property_API.Get_Value('C_BankStatementInt', 'LOG', 'FLAG') = '1') THEN
+      dbms_output.put_line(p_msg);
+    END IF;
+  END writelog;
+
+  PROCEDURE create_load_ext_file(p_bank_account       VARCHAR2,
+                                 p_company            VARCHAR2,
+                                 p_closing_balance    NUMBER,
+                                 p_stmt_date          DATE,
+                                 p_currency_code      VARCHAR2,
+                                 p_opening_balance    NUMBER,
+                                 p_row_cnt            NUMBER,
+                                 p_trx_amount_array   dbms_sql.number_table,
+                                 p_trx_date_array     dbms_sql.date_table,
+                                 p_supplier_array     dbms_sql.varchar2_table,
+                                 p_filename           VARCHAR2,
+                                 p_60F_found          BOOLEAN,
+                                 p_62F_found          BOOLEAN,
+                                 p_bank_stmt_no       VARCHAR2,
+                                 p_bank_stmt_file_no  VARCHAR2,
+                                 p_trans_info_2_array dbms_sql.varchar2_table,
+                                 p_trans_info_3_array dbms_sql.varchar2_table,
+                                 p_trans_info_4_array dbms_sql.varchar2_table,
+                                 p_trans_info_5_array dbms_sql.varchar2_table,
+                                 p_trans_info_6_array dbms_sql.varchar2_table,
+                                 p_trans_info_8_array dbms_sql.varchar2_table,
+                                 p_trans_info_9_array dbms_sql.varchar2_table) IS
+    v_attr            VARCHAR2(3000);
+    newinfo_          VARCHAR2(2000);
+    objid_            VARCHAR2(30);
+    objversion_       VARCHAR2(30);
+    parameterString_  VARCHAR2(2000);
+    temp_             VARCHAR2(2000);
+    seq_load_file_id_ NUMBER;
+    newrectrans_      Ext_file_Trans_Tab%ROWTYPE;
+  
+    c_file_type           VARCHAR2(100) := 'BankStatement';
+    c_client_server       VARCHAR2(1)   := '1';
+    c_file_template       VARCHAR2(100) := 'STDBNKSTAT';
+    c_file_direction      VARCHAR2(1)   := '1';
+    c_cash_check_supp_v_t VARCHAR2(10)  := 'TRUE';
+    c_cash_check_cust_v_t VARCHAR2(10)  := 'TRUE';
+    c_user_group          VARCHAR2(10)  := 'AC';
+    c_cust_check_v_t      VARCHAR2(10)  := 'COF';
+    c_supp_check_v_t      VARCHAR2(10)  := 'SOF';
+    c_param_set           VARCHAR2(10)  := 'TRUE';
+    c_lu_set              VARCHAR2(10)  := 'TRUE';
+    c_file_dir_db         VARCHAR2(1)   := '1';
+  
+    v_trans_info_1    VARCHAR2(50);
+    v_prev_load_id    NUMBER;
+    v_trans_info_3    VARCHAR2(50); --last bank stement file no
+    v_closing_balance NUMBER := p_closing_balance;
+    v_opening_balance NUMBER := p_opening_balance;
+  
+    objid_H_                  VARCHAR2(30);
+    objversion_H_             VARCHAR2(30);
+    v_attr_H_                 VARCHAR2(3000);
+    info_H_                   VARCHAR2(2000);
+    v_file_line               VARCHAR2(4000);
+    v_new_file_line           VARCHAR2(4000);
+    v_bank_stmt_file_cnt      NUMBER;
+    v_delta                   NUMBER;
+    v_bank_stmt_file_curr_cnt NUMBER;
+    v_bank_stmt_file_total    NUMBER;
+  
+    p_trans_info_2 VARCHAR2(2000);
+    p_trans_info_3 VARCHAR2(2000);
+    p_trans_info_4 VARCHAR2(2000);
+    p_trans_info_5 VARCHAR2(2000);
+    p_trans_info_6 VARCHAR2(2000);
+    p_supplier     VARCHAR2(2000);
+    p_trans_info_8 VARCHAR2(2000);
+    p_trans_info_9 VARCHAR2(2000);
+  
+    p_trx_amount_ NUMBER;
+    p_trx_date_   DATE;
+    
+    file_count_ NUMBER := 0;
+    
+    CURSOR c_getPreviousLoadId IS
+      SELECT fl.load_file_id
+        FROM EXT_FILE_LOAD fl
+        LEFT JOIN EXT_FILE_TRANS ft
+          ON (fl.load_file_id = ft.load_file_id)
+       WHERE fl.FILE_TYPE = 'BankStatement'
+         AND fl.FILE_TEMPLATE_ID = 'STDBNKSTAT'
+         AND ft.FILE_LINE like 'H;%;%;%;%;' || p_bank_stmt_no || ';%'
+         AND fl.state <> 'Transferred'
+         AND fl.parameter_string LIKE
+             '%$CASH_ACCOUNT=' || p_bank_account || '%'
+            --ICCA start 210730
+         AND extract(year from p_stmt_date) IN
+             (select MAX(substr(tt.file_line, 3, 4))
+                from ext_file_trans tt
+               where tt.load_file_id = fl.load_file_id
+                 and tt.file_line LIKE 'H%')
+      --ICCA end 210730
+      ;
+  
+    CURSOR c_getHeaderRow(pli number) IS
+      SELECT ft.OBJID, ft.OBJVERSION, ft.file_line, ft.n0
+        FROM EXT_FILE_TRANS ft
+        JOIN EXT_FILE_LOAD fl
+          ON (ft.load_file_id = fl.load_file_id AND
+             fl.FILE_TYPE = 'BankStatement' and
+             fl.FILE_TEMPLATE_ID = 'STDBNKSTAT')
+       WHERE ft.FILE_LINE like 'H;%'
+         AND ft.LOAD_FILE_ID = pli;
+  
+    CURSOR c_getCountDetailRows(pli number, bank_stmt_file_no VARCHAR2) IS
+      SELECT count(ft.OBJID)
+        FROM EXT_FILE_TRANS ft
+        JOIN EXT_FILE_LOAD fl
+          ON (ft.load_file_id = fl.load_file_id AND
+             fl.FILE_TYPE = 'BankStatement' and
+             fl.FILE_TEMPLATE_ID = 'STDBNKSTAT')
+       WHERE ft.FILE_LINE like
+             'D;%;%;%;%;%;%;%;%;%;%;%;%;%;' || bank_stmt_file_no
+         AND ft.LOAD_FILE_ID = pli;
+  
+    CURSOR c_getLastRowNo(pli number) IS
+      SELECT max(ft.row_no)
+        FROM EXT_FILE_TRANS ft
+        JOIN EXT_FILE_LOAD fl
+          ON (ft.load_file_id = fl.load_file_id AND
+             fl.FILE_TYPE = 'BankStatement' and
+             fl.FILE_TEMPLATE_ID = 'STDBNKSTAT')
+       WHERE ft.LOAD_FILE_ID = pli;
+  
+    CURSOR c_getHowManyFileNo(pli number) IS
+      SELECT COUNT(x.bank_stmt_file_no)
+        FROM (SELECT DISTINCT NVL(SUBSTR(ft.file_line,
+                                         INSTR(ft.file_line, ';', -1) + 1,
+                                         LENGTH(ft.file_line)),
+                                  '*') bank_stmt_file_no
+                FROM EXT_FILE_TRANS ft
+                JOIN EXT_FILE_LOAD fl
+                  ON (ft.load_file_id = fl.load_file_id AND
+                     fl.FILE_TYPE = 'BankStatement' and
+                     fl.FILE_TEMPLATE_ID = 'STDBNKSTAT')
+               WHERE ft.LOAD_FILE_ID = pli
+                 AND ft.FILE_LINE like 'D;%') x;
+  
+    CURSOR c_getLastFileNo(pli number) IS
+      SELECT CAST(REPLACE(SUBSTR(ft.file_line,
+                                 INSTR(ft.file_line, ';', -2),
+                                 LENGTH(ft.file_line)),
+                          ';',
+                          '') AS NUMBER)
+        FROM EXT_FILE_TRANS ft
+        JOIN EXT_FILE_LOAD fl
+          ON (ft.load_file_id = fl.load_file_id AND
+             fl.FILE_TYPE = 'BankStatement' and
+             fl.FILE_TEMPLATE_ID = 'STDBNKSTAT')
+       WHERE ft.FILE_LINE like 'H;%'
+         AND ft.LOAD_FILE_ID = pli;
+    
+    FUNCTION Get_Curr_Rate(curr_code_ IN VARCHAR2, trx_date_ IN DATE)
+      RETURN NUMBER IS
+      rate_ NUMBER;
+    BEGIN
+      SELECT MAX(currency_rate)
+        INTO rate_
+        FROM (SELECT t.currency_rate
+                FROM currency_rate t
+               WHERE t.company = p_company
+                 AND t.currency_code = p_currency_code
+                 AND t.valid_from <= trx_date_
+               ORDER BY t.valid_from DESC)
+       WHERE ROWNUM = 1;
+      RETURN NVL(rate_, 1);
+    END Get_Curr_Rate;
+      
+  BEGIN
+    general_sys.init_method(lu_name_,
+                            'C_BANK_STATEMENT_INT_API',
+                            'create_load_ext_file');
+  
+    IF (p_60f_found AND p_62f_found) THEN
+      v_trans_info_1 := 'full_load';
+      writelog('Scenario: ' || v_trans_info_1);
+    ELSE
+      v_trans_info_1 := 'partial_load';
+    
+      -- Get Previous load id (if it exists)
+      OPEN c_getPreviousLoadId;
+      FETCH c_getPreviousLoadId
+        INTO v_prev_load_id;
+      CLOSE c_getPreviousLoadId;
+    
+    END IF;
+  
+    -- ------------------------------------------
+    -- CREATE EXTERNAL FILE LOAD
+    -- ------------------------------------------
+    IF (v_trans_info_1 = 'full_load' OR (v_trans_info_1 = 'partial_load' AND v_prev_load_id IS NULL)) THEN
+    
+      IF (v_trans_info_1 = 'partial_load') THEN        
+        writelog('Scenario: partial_load 1st file (Load Id creation)');
+      END IF;
+      -- new load file ID 
+      seq_load_file_id_ := EXTERNAL_FILE_UTILITY_API.GET_NEXT_SEQ;
+      
+      parameterString_ := Message_Sys.Construct('PARAMETER_MESSAGE');
+    
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'FILE_TYPE',                  c_file_type);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'SET_ID',                     ext_type_param_set_api.get_default_set_id(c_file_type));
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'CLIENT_SERVER',              c_client_server);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'FILE_TEMPLATE_ID',           c_file_template);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'FILE_DIRECTION_DB',          c_file_direction);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'CASH_MATCH_SUPPLIER_CHECK',  c_cash_check_supp_v_t);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'CASH_MATCH_CUSTOMER_CHECK',  c_cash_check_cust_v_t);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'USER_GROUP',                 c_user_group);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'CUST_CHECK_VOU_TYPE',        c_cust_check_v_t);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'SUPP_CHECK_VOU_TYPE',        c_supp_check_v_t);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'PARAM_SET',                  c_param_set);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'FILE_NAME',                  p_filename);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'LU_SET',                     c_lu_set);    
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'COMPANY',                    p_company);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'NEW_COMPANY',                p_company);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'CASH_ACCOUNT',               p_bank_account);
+      EXT_FILE_MESSAGE_API.CHECK_AND_REPLACE_ATTRIBUTE_(parameterString_, 'STATEMENT_DATE',             p_stmt_date);
+      
+      client_sys.clear_attr(v_attr);
+    
+      client_sys.add_to_attr('PARAMETER_STRING',   parameterString_,                                      v_attr);    
+      client_sys.add_to_attr('COMPANY',            p_company,                                             v_attr);
+      client_sys.add_to_attr('USER_ID',            fnd_session_api.get_fnd_user,                          v_attr);
+      client_sys.add_to_attr('LOAD_DATE',          trunc(SYSDATE),                                        v_attr);
+      client_sys.add_to_attr('FILE_NAME',          p_filename,                                            v_attr);
+      client_sys.add_to_attr('FILE_TYPE',          c_file_type,                                           v_attr);
+      client_sys.add_to_attr('FILE_TEMPLATE_ID',   c_file_template,                                       v_attr);
+      client_sys.add_to_attr('LOAD_FILE_ID',       seq_load_file_id_,                                     v_attr);
+      client_sys.add_to_attr('STATE_DB',           Ext_File_State_API.DB_LOADED,                          v_attr);
+      client_sys.add_to_attr('FILE_DIRECTION_DB',  c_file_dir_db,                                         v_attr);
+      client_sys.add_to_attr('SET_ID',             ext_type_param_set_api.get_default_set_id(c_file_type),v_attr);
+    
+      Ext_File_Load_Api.New__(newinfo_, objid_, objversion_, v_attr, 'DO');
+    
+      /***************HEADER row ********************/
+      newrectrans_.load_file_id   := seq_load_file_id_;
+      newrectrans_.row_no         := 1;
+      newrectrans_.record_set_no  := 1;
+      newrectrans_.record_type_id := 'HEADER';
+      newrectrans_.rowversion     := sysdate;
+      newrectrans_.row_state      := Ext_File_Row_State_API.DB_LOADED;  
+    
+      writelog('v_closing_balance>>>>>>>>>>>>>: ' || v_closing_balance);
+    
+      IF (v_trans_info_1 = 'partial_load') THEN
+        newrectrans_.N0             := 1; -- counting no of files received for partial load 
+        IF (not p_60f_found) THEN
+          v_opening_balance := 0;
+        END IF;
+      
+        IF (not p_62f_found) THEN
+          v_closing_balance := 0;
+        ELSE
+          v_trans_info_3 := p_bank_stmt_file_no; -- store last bank statemnet file no
+        END IF;
+      END IF;
+      writelog('v_closing_balance>>>>>>>>>>>>>: ' || v_closing_balance);
+      
+      newrectrans_.file_line := 'H;' 
+                                || TO_CHAR(p_stmt_date, 'YYYY-MM-DD')      || ';' ||
+                                v_opening_balance                          || ';' ||
+                                v_closing_balance                          || ';' || 
+                                v_trans_info_1                             || ';' ||
+                                p_bank_stmt_no                             || ';' || 
+                                v_trans_info_3                             || ';';
+      
+      EXT_FILE_TRANS_API.Insert_record(newrectrans_); -- insert Header Row 
+      
+    
+      /***********DETAIL rows ***********************/
+      IF (v_trans_info_1 = 'partial_load' AND p_row_cnt = 0) THEN  -- p_row_cnt is no of 61 lines , means lines relate to any transactions 
+        newrectrans_ := NULL;
+      
+        newrectrans_.load_file_id   := seq_load_file_id_;
+        newrectrans_.row_no         := 2;
+        newrectrans_.record_set_no  := 2;
+        newrectrans_.record_type_id := 'DETAIL';
+        newrectrans_.rowversion     := sysdate;
+        newrectrans_.row_state      := Ext_File_Row_State_API.DB_LOADED;
+        
+        newrectrans_.file_line      :=  'D;' ||
+                                        TO_CHAR(p_stmt_date, 'YYYY-MM-DD') ||';*;' || 
+                                        p_currency_code || ';0;' ||
+                                        Get_Curr_Rate(p_currency_code,NVL(p_trx_date_array(1), SYSDATE)) || ';0;0;' ||
+                                        p_filename ||
+                                        ';BANK_STATEMENT_DUMMY_LINE;;;;;' ||
+                                        p_bank_stmt_file_no;
+                                        
+        EXT_FILE_TRANS_API.Insert_record(newrectrans_);  -- insert Dummy Detail Row
+      ELSE
+        FOR i IN 1 .. p_row_cnt LOOP
+        
+          BEGIN
+            IF p_trans_info_2_array IS NULL THEN
+              p_trans_info_2 := '';
+            ELSE
+              p_trans_info_2 := p_trans_info_2_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_trans_info_2 := '';
+          END;
+        
+          BEGIN
+            IF p_trans_info_3_array IS NULL THEN
+              p_trans_info_3 := '';
+            ELSE
+              p_trans_info_3 := p_trans_info_3_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_trans_info_3 := '';
+          END;
+        
+          BEGIN
+            IF p_trans_info_4_array IS NULL THEN
+              p_trans_info_4 := '';
+            ELSE
+              p_trans_info_4 := p_trans_info_4_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_trans_info_4 := '';
+          END;
+        
+          BEGIN
+            IF p_trans_info_5_array IS NULL THEN
+              p_trans_info_5 := '';
+            ELSE
+              p_trans_info_5 := p_trans_info_5_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_trans_info_5 := '';
+          END;
+        
+          BEGIN
+            IF p_trans_info_6_array IS NULL THEN
+              p_trans_info_6 := '';
+            ELSE
+              p_trans_info_6 := p_trans_info_6_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_trans_info_6 := '';
+          END;
+        
+          BEGIN
+            IF p_supplier_array IS NULL THEN
+              p_supplier := '';
+            ELSE
+              p_supplier := p_supplier_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_supplier := '';
+          END;
+        
+          BEGIN
+            IF p_trans_info_8_array IS NULL THEN
+              p_trans_info_8 := '';
+            ELSE
+              p_trans_info_8 := p_trans_info_8_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_trans_info_8 := '';
+          END;
+        
+          BEGIN
+            IF p_trans_info_9_array IS NULL THEN
+              p_trans_info_9 := '';
+            ELSE
+              p_trans_info_9 := p_trans_info_9_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_trans_info_9 := '';
+          END;
+        
+          BEGIN
+            IF p_trx_date_array IS NULL THEN
+              p_trx_date_ := SYSDATE;
+            ELSE
+              p_trx_date_ := p_trx_date_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_trx_date_ := SYSDATE;
+          END;
+        
+          BEGIN
+            IF p_trx_amount_array IS NULL THEN
+              p_trx_amount_ := 0;
+            ELSE
+              p_trx_amount_ := p_trx_amount_array(i);
+            END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+              p_trx_amount_ := 0;
+          END;
+          
+          IF p_trx_amount_ !=0 THEN  -- line will get added only if there is an amount 
+        
+            newrectrans_                := NULL;
+            newrectrans_.load_file_id   := seq_load_file_id_;
+            newrectrans_.row_no         := i + 1;
+            newrectrans_.record_set_no  := i + 1;
+            newrectrans_.record_type_id := 'DETAIL';
+            newrectrans_.rowversion     := sysdate;
+            newrectrans_.row_state      := Ext_File_Row_State_API.DB_LOADED;
+            
+            newrectrans_.file_line      := 'D;' ||
+                                           TO_CHAR(p_trx_date_, 'YYYY-MM-DD') ||';*;' || 
+                                           p_currency_code || ';' ||
+                                           p_trx_amount_ || ';' ||
+                                           Get_Curr_Rate(p_currency_code, p_trx_date_) || ';' ||
+                                           p_trx_amount_ || ';' || p_supplier;
+            
+            newrectrans_.file_line      := newrectrans_.file_line || ';' ||
+                                           p_filename || ';' || p_trans_info_2 || ';' ||
+                                           p_trans_info_3;
+                                           
+            newrectrans_.file_line      := newrectrans_.file_line || ';' ||
+                                           p_trans_info_4 || ';' || p_trans_info_5 || ';' ||
+                                           p_trans_info_6 || ';' ||
+                                           p_bank_stmt_file_no || ';' ||
+                                           p_trans_info_8 || ';' || p_trans_info_9;
+                                           
+            EXT_FILE_TRANS_API.Insert_record(newrectrans_); -- insert Detail Row
+          END IF; 
+        END LOOP;
+      END IF;
+    
+      IF (v_trans_info_1 = 'full_load') THEN
+        BEGIN
+          -- Do Unpack
+          External_File_Utility_API.Unpack_Ext_Line(c_file_type,
+                                                    c_file_template,
+                                                    seq_load_file_id_,
+                                                    p_company);
+        
+          -- Do API call
+          External_File_Utility_API.start_api_to_call(temp_,
+                                                      seq_load_file_id_);
+        
+        EXCEPTION
+          WHEN OTHERS THEN
+            client_sys.clear_attr(v_attr);
+            newinfo_ := null;
+            client_sys.add_to_attr('STATE_DB', Ext_File_State_API.DB_TRANSFER_ERROR,v_attr);
+                                               
+            ext_file_load_api.modify__(newinfo_, objid_, objversion_, v_attr, 'DO'); 
+        END;
+      END IF;
+    
+    ELSE
+      writelog('Scenario: partial_load 2nd file or subsequent (Load Id update) -> ' || v_prev_load_id);
+      
+      -- Get Previous load id (if it exists)
+      OPEN c_getHeaderRow(v_prev_load_id);
+      FETCH c_getHeaderRow INTO objid_H_, objversion_H_, v_file_line, file_count_;
+      CLOSE c_getHeaderRow;
+    
+      -- -----------------------------
+      -- HEADER ROW
+      -- -----------------------------
+      IF (objid_H_ IS NOT NULL AND objversion_H_ IS NOT NULL) THEN
+        file_count_ := file_count_ + 1; -- increase file count and update N0 
+        
+        client_sys.clear_attr(v_attr_H_); 
+        client_sys.add_to_attr('N0', file_count_, v_attr_H_);
+        
+        IF (p_60f_found OR p_62f_found) THEN  
+          writelog('Updating row H-> ' || 'objid_H_: ' || objid_H_ || ' objversion_H_: ' || objversion_H_);          
+          
+          info_H_ := null;
+        
+          IF (p_60f_found) THEN
+            -- Update opening balance into row H
+            v_new_file_line := SUBSTR(v_file_line, 0, INSTR(v_file_line, ';')); -- H;
+            v_file_line     := SUBSTR(v_file_line, INSTR(v_file_line, ';') + 1, LENGTH(v_file_line));
+            v_new_file_line := v_new_file_line || SUBSTR(v_file_line, 0, INSTR(v_file_line, ';'));
+            v_file_line     := SUBSTR(v_file_line,INSTR(v_file_line, ';') + 1, LENGTH(v_file_line));
+            v_new_file_line := v_new_file_line || v_opening_balance || ';'; -- opening balance
+            v_file_line     := SUBSTR(v_file_line,INSTR(v_file_line, ';') + 1, LENGTH(v_file_line));
+            v_new_file_line := v_new_file_line || v_file_line;
+            v_file_line     := v_new_file_line;          
+          END IF;
+        
+          IF (p_62f_found) THEN
+            -- Update opening balance into row H
+            v_new_file_line := SUBSTR(v_file_line,0,INSTR(v_file_line, ';')); -- H;
+            v_file_line     := SUBSTR(v_file_line,INSTR(v_file_line, ';') + 1,LENGTH(v_file_line));
+            v_new_file_line := v_new_file_line ||SUBSTR(v_file_line, 0, INSTR(v_file_line, ';'));
+            v_file_line     := SUBSTR(v_file_line, INSTR(v_file_line, ';') + 1, LENGTH(v_file_line));
+            v_new_file_line := v_new_file_line || SUBSTR(v_file_line, 0, INSTR(v_file_line, ';'));
+            v_file_line     := SUBSTR(v_file_line, INSTR(v_file_line, ';') + 1, LENGTH(v_file_line));
+            v_new_file_line := v_new_file_line || v_closing_balance || ';'; -- closing balance;
+            v_file_line     := SUBSTR(v_file_line, INSTR(v_file_line, ';') + 1, LENGTH(v_file_line)); -- partial_load;00298;;
+            v_new_file_line := v_new_file_line || SUBSTR(v_file_line, 0, INSTR(v_file_line, ';'));
+            v_file_line     := SUBSTR(v_file_line, INSTR(v_file_line, ';') + 1, LENGTH(v_file_line)); --00298;;
+            v_new_file_line := v_new_file_line || SUBSTR(v_file_line, 0, INSTR(v_file_line, ';'));
+            v_new_file_line := v_new_file_line || p_bank_stmt_file_no || ';';
+            v_file_line     := v_new_file_line;
+          END IF;
+        
+          client_sys.add_to_attr('FILE_LINE', v_new_file_line, v_attr_H_); -- update file_line
+        END IF;
+        EXT_FILE_TRANS_API.modify__(info_H_, objid_H_, objversion_H_, v_attr_H_,'DO');
+      
+      END IF;
+    
+      -- -----------------------------
+      -- DETAIL ROWS
+      -- -----------------------------
+      OPEN c_getCountDetailRows(v_prev_load_id, p_bank_stmt_file_no);
+      FETCH c_getCountDetailRows INTO v_bank_stmt_file_cnt;
+      CLOSE c_getCountDetailRows;
+    
+      -- Check if it has not been created previously
+      IF (v_bank_stmt_file_cnt = 0) THEN
+        -- Get delta
+        OPEN c_getLastRowNo(v_prev_load_id);
+        FETCH c_getLastRowNo INTO v_delta;
+        CLOSE c_getLastRowNo;
+      
+        IF (p_row_cnt = 0) THEN
+          newrectrans_ := NULL;
+        
+          newrectrans_.load_file_id   := v_prev_load_id;
+          newrectrans_.row_no         := 1 + v_delta;
+          newrectrans_.record_set_no  := 1 + v_delta;
+          newrectrans_.record_type_id := 'DETAIL';
+          newrectrans_.rowversion     := sysdate;
+          newrectrans_.row_state      := Ext_File_Row_State_API.DB_LOADED;
+          
+          newrectrans_.file_line      := 'D;' ||
+                                         TO_CHAR(p_stmt_date, 'YYYY-MM-DD') || ';*;' || 
+                                         p_currency_code || ';0;' ||
+                                         Get_Curr_Rate(p_currency_code, NVL(p_trx_date_array(1), SYSDATE)) || ';0;0;' ||
+                                         p_filename ||
+                                         ';BANK_STATEMENT_DUMMY_LINE;;;;;' ||
+                                         p_bank_stmt_file_no;
+          
+          EXT_FILE_TRANS_API.Insert_record(newrectrans_); -- insert Detail Row
+        ELSE
+        
+          FOR i IN 1 .. p_row_cnt LOOP          
+            BEGIN
+              IF p_trans_info_2_array IS NULL THEN
+                p_trans_info_2 := '';
+              ELSE
+                p_trans_info_2 := p_trans_info_2_array(i);
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_trans_info_2 := '';
+            END;
+            BEGIN
+              IF p_trans_info_3_array IS NULL THEN
+                p_trans_info_3 := '';
+              ELSE
+                p_trans_info_3 := p_trans_info_3_array(i);
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_trans_info_3 := '';
+            END;
+            BEGIN
+              IF p_trans_info_4_array IS NULL THEN
+                p_trans_info_4 := '';
+              ELSE
+                p_trans_info_4 := p_trans_info_4_array(i);
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_trans_info_4 := '';
+            END;
+            BEGIN
+              IF p_trans_info_5_array IS NULL THEN
+                p_trans_info_5 := '';
+              ELSE
+                p_trans_info_5 := p_trans_info_5_array(i);
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_trans_info_5 := '';
+            END;
+            BEGIN
+              IF p_trans_info_6_array IS NULL THEN
+                p_trans_info_6 := '';
+              ELSE
+                p_trans_info_6 := p_trans_info_6_array(i);
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_trans_info_6 := '';
+            END;
+            BEGIN
+              IF p_supplier_array IS NULL THEN
+                p_supplier := '';
+              ELSE
+                p_supplier := p_supplier_array(i);
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_supplier := '';
+            END;
+            BEGIN
+              IF p_trans_info_8_array IS NULL THEN
+                p_trans_info_8 := '';
+              ELSE
+                p_trans_info_8 := p_trans_info_8_array(i);
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_trans_info_8 := '';
+            END;
+            BEGIN
+              IF p_trans_info_9_array IS NULL THEN
+                p_trans_info_9 := '';
+              ELSE
+                p_trans_info_9 := p_trans_info_8_array(i);
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_trans_info_9 := '';
+            END;
+          
+            BEGIN
+              IF p_trx_date_array IS NULL THEN
+                p_trx_date_ := SYSDATE;
+              ELSE
+                p_trx_date_ := p_trx_date_array(i);
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_trx_date_ := SYSDATE;
+            END;
+          
+            BEGIN
+              IF p_trx_amount_array IS NULL THEN
+                p_trx_amount_ := 0;
+              ELSE
+                p_trx_amount_ := p_trx_amount_array(i);
+              END IF;
+            
+            EXCEPTION
+              WHEN OTHERS THEN
+                p_trx_amount_ := 0;
+            END;
+          
+            newrectrans_ := NULL;
+          
+            newrectrans_.load_file_id   := v_prev_load_id;
+            newrectrans_.row_no         := i + v_delta;
+            newrectrans_.record_set_no  := i + v_delta;
+            newrectrans_.record_type_id := 'DETAIL';
+            newrectrans_.rowversion     := sysdate;
+            newrectrans_.row_state      := Ext_File_Row_State_API.DB_LOADED;
+            
+            newrectrans_.file_line      := 'D;' ||
+                                           TO_CHAR(p_trx_date_, 'YYYY-MM-DD') ||';*;' || 
+                                           p_currency_code || ';' ||
+                                           p_trx_amount_ || ';' ||
+                                           Get_Curr_Rate(p_currency_code, NVL(p_trx_date_, SYSDATE)) || ';' ||
+                                           p_trx_amount_ || ';' || 
+                                           p_supplier;
+            
+            newrectrans_.file_line         := newrectrans_.file_line || ';' ||
+                                              p_filename || ';' || 
+                                              p_trans_info_2 || ';' ||
+                                              p_trans_info_3;
+                                              
+            newrectrans_.file_line        := newrectrans_.file_line || ';' ||
+                                             p_trans_info_4 || ';' ||
+                                             p_trans_info_5 || ';' ||
+                                             p_trans_info_6 || ';' ||
+                                             p_bank_stmt_file_no || ';' ||
+                                             p_trans_info_8 || ';' ||
+                                             p_trans_info_9;
+          
+            EXT_FILE_TRANS_API.Insert_record(newrectrans_); -- insert Detail Row
+          END LOOP;
+        END IF;
+      END IF;
+    
+      -- ---------------------------------------------------------
+      -- PROCESS if we have received all bank statement files
+      -- ---------------------------------------------------------
+      -- Get total received bank statement files
+      OPEN c_getHowManyFileNo(v_prev_load_id);
+      FETCH c_getHowManyFileNo
+        INTO v_bank_stmt_file_curr_cnt;
+      CLOSE c_getHowManyFileNo;
+    
+      -- Get total expected bank statement files
+      OPEN c_getLastFileNo(v_prev_load_id);
+      FETCH c_getLastFileNo
+        INTO v_bank_stmt_file_total;
+      CLOSE c_getLastFileNo;
+      
+      dbms_output.put_line('************** logs ***********************');
+      dbms_output.put_line(' v_bank_stmt_file_total - ' || v_bank_stmt_file_total);
+      dbms_output.put_line('file_count_ - ' || file_count_);
+      dbms_output.put_line('************** logs ***********************');
+    
+     IF v_bank_stmt_file_total = file_count_ THEN -- IF (v_bank_stmt_file_total IS NOT NULL AND (v_bank_stmt_file_curr_cnt = v_bank_stmt_file_total)) THEN
+        dbms_output.put_line('before Unpack');
+        BEGIN
+          -- Do Unpack
+          External_File_Utility_API.Unpack_Ext_Line(c_file_type,
+                                                    c_file_template,
+                                                    v_prev_load_id,
+                                                    p_company);
+        
+          -- Do API call
+          External_File_Utility_API.start_api_to_call(temp_,
+                                                      v_prev_load_id);
+        
+        EXCEPTION
+          WHEN OTHERS THEN
+            client_sys.clear_attr(v_attr);
+            newinfo_ := null;
+            client_sys.add_to_attr('STATE_DB',
+                                   Ext_File_State_API.DB_TRANSFER_ERROR,
+                                   v_attr);
+            ext_file_load_api.modify__(newinfo_,
+                                       objid_,
+                                       objversion_,
+                                       v_attr,
+                                       'DO');
+        END;
+      END IF;
+    
+    END IF;
+  
+  END create_load_ext_file;
+
+  -----------------------------------------------------------------------------
+  -------------------- LU SPECIFIC PUBLIC METHODS -----------------------------
+  -----------------------------------------------------------------------------
+
+  PROCEDURE start_process IS
+    v_file UTL_FILE.FILE_TYPE;  
+    v_dir_bank_stmt       VARCHAR2(40) := 'BANK_STATEMENTS_DIR';
+    v_dir_ok_bank_stmt    VARCHAR2(40) := 'BANK_STATEMENTS_OK_DIR';
+    v_dir_error_bank_stmt VARCHAR2(40) := 'BANK_STATEMENTS_ERROR_DIR';
+  
+    v_bank_stmt_dir_path VARCHAR2(200);
+    v_file_list          VARCHAR2(32767);
+    v_filename           VARCHAR2(200);
+  
+    v_successOperation  NUMBER;
+    v_commentsOperation VARCHAR2(4000);
+    v_row               VARCHAR2(2000);
+    v_prefix_code       VARCHAR2(5);
+    v_cnt_61_           NUMBER;
+    v_cnt_86_           NUMBER;
+    v_get_line          BOOLEAN;
+  
+    v_closing_balance   NUMBER;
+    v_stmt_date         DATE;
+    v_currency_code     VARCHAR2(3);
+    v_opening_balance   NUMBER;
+    v_60F_found         BOOLEAN;
+    v_62F_found         BOOLEAN;
+    v_bank_stmt_no      VARCHAR2(50); -- bank statement number
+    v_bank_stmt_file_no VARCHAR2(50); -- bank statement file number
+  
+    v_trx_amount_array           dbms_sql.number_table;
+    v_trx_date_array             dbms_sql.date_table;
+    v_payment_order_array        dbms_sql.varchar2_table;
+    v_payment_order_lineno_array dbms_sql.varchar2_table;
+    v_supplier_array             dbms_sql.varchar2_table;
+    v_trans_info_2_array         dbms_sql.varchar2_table;
+    v_trans_info_3_array         dbms_sql.varchar2_table;
+    v_trans_info_4_array         dbms_sql.varchar2_table;
+    v_trans_info_5_array         dbms_sql.varchar2_table;
+    v_trans_info_6_array         dbms_sql.varchar2_table;
+    v_trans_info_8_array         dbms_sql.varchar2_table;
+    v_trans_info_9_array         dbms_sql.varchar2_table;
+  
+    v_bank_account         VARCHAR2(30);
+    v_company              VARCHAR2(20);
+    v_str_aux              VARCHAR2(100);
+    v_ncom_position_       NUMBER := 0;
+    i_                     NUMBER := 0;
+    local_trans_date_mmdd_ VARCHAR2(6);
+    
+    CURSOR c_getPathDirBankStmt IS
+      SELECT directory_path
+        FROM all_directories
+       WHERE directory_name = 'BANK_STATEMENTS_DIR';
+  
+    CURSOR c_getSupplierFromPayOrder(p_company        VARCHAR2,
+                                     p_pay_order      VARCHAR2,
+                                     p_pay_order_line VARCHAR2) IS
+      select IDENTITY
+        from pay_trace_item_cash_account
+       where 1 = 1
+         AND company = p_company
+         and order_id = p_pay_order
+         and order_item_id = p_pay_order_line;
+  
+    currency_       VARCHAR2(30);
+    v_aux_cash_acc_ VARCHAR2(20);
+    
+    CURSOR c_getCashAccount(p_company     VARCHAR2,
+                            p_account_num VARCHAR2,
+                            currency_     VARCHAR2) IS
+      SELECT cash_account
+        FROM CASH_ACCOUNT
+       WHERE company = p_company
+         AND (account_identity = p_account_num OR
+             LOCKBOX_NO = p_account_num)
+         AND currency = currency_
+         AND blocked_for_use = 'FALSE';    
+  
+  BEGIN
+    general_sys.init_method(lu_name_, 'C_BANK_STATEMENT_INT_API', 'start_process');
+    writelog('C_BANK_STATEMENT_INT_API->start_process');
+  
+    -- Get Folder containing files
+    OPEN c_getPathDirBankStmt;
+    FETCH c_getPathDirBankStmt INTO v_bank_stmt_dir_path;
+    CLOSE c_getPathDirBankStmt;
+    
+    IF (v_bank_stmt_dir_path IS NOT NULL) THEN
+      -- Look for new files into Folder, It it is found, insert to the control table
+      v_file_list := Check_Bank_Statement_files(v_bank_stmt_dir_path);
+    
+      IF (v_file_list is not null) THEN
+        WHILE (v_file_list like '%||%') LOOP
+        
+          v_filename := SUBSTR(v_file_list, 0, INSTR(v_file_list, '||') - 1);
+          v_commentsOperation := NULL;
+          v_successOperation  := 1;
+          
+          BEGIN
+            v_file := UTL_FILE.FOPEN(v_dir_bank_stmt, v_filename, 'R', 32767);
+            
+            i_ := i_ + 1;
+            ----------------------------
+            -- Clean variables
+            v_str_aux         := null;
+            v_closing_balance := null;
+            v_stmt_date       := null;
+            v_currency_code   := null;
+            v_opening_balance := null;
+            v_trx_amount_array.DELETE;
+            v_trx_date_array.DELETE;
+            v_payment_order_array.DELETE;
+            v_payment_order_lineno_array.DELETE;
+            v_supplier_array.DELETE;
+            v_trans_info_2_array.DELETE;
+            v_trans_info_3_array.DELETE;
+            v_trans_info_4_array.DELETE;
+            v_trans_info_5_array.DELETE;
+            v_trans_info_6_array.DELETE;
+            v_trans_info_8_array.DELETE;
+            v_trans_info_9_array.DELETE;
+            v_bank_account         := null;
+            v_company              := null;
+            v_cnt_61_              := 0;
+            v_cnt_86_              := 0;
+            v_get_line             := true;
+            v_60F_found            := false;
+            v_62F_found            := false;
+            v_bank_stmt_no         := null;
+            v_bank_stmt_file_no    := null;
+            v_ncom_position_       := 0;
+            local_trans_date_mmdd_ := NULL;
+          
+            -- Get Company
+            v_company := SUBSTR(v_filename, 0, INSTR(v_filename, '_') - 1); 
+                     
+            IF UTL_FILE.IS_OPEN(v_file) THEN            
+              -- We loop through the lines
+              LOOP
+                BEGIN
+                  -- Do we move to the next line
+                  IF (v_get_line) THEN
+                    UTL_FILE.GET_LINE(v_file, v_row);
+                  ELSE
+                    -- When it is false, then set true, in order to get a new line in the next loop
+                    v_get_line := true;
+                  END IF;
+                  v_prefix_code := substr(v_row, 0, 3);
+                
+                  CASE v_prefix_code
+                    WHEN ':25' THEN
+                      -- Get bank account
+                      v_str_aux := substr(v_row, 5, LENGTH(v_row) - 4);
+                      --(+) 200911 ICCA (START)
+                      BEGIN
+                        FOR curr_rec_ IN (SELECT currency_code
+                                            FROM iso_currency) LOOP
+                          IF (v_str_aux LIKE '%' || curr_rec_.currency_code) THEN
+                            v_str_aux := substr(v_str_aux,
+                                                1,
+                                                LENGTH(v_str_aux) - 3);
+                          END IF;
+                        END LOOP;
+                      END;
+                      
+                      --check for company-bic_code-curr_code combination in v_filename and take the curr_code
+                      currency_ := NULL;
+                      FOR xrec_ IN (SELECT isoc.currency_code
+                                      FROM COMPANY c, ISO_CURRENCY isoc
+                                     WHERE UPPER(v_filename) LIKE
+                                           UPPER('%' || c.company || '%' ||
+                                                  --c.company || Ivo COUTO 2025-11-04 New file from CashOne
+                                                 c.company || '%' ||
+                                                 isoc.currency_code || '%')) LOOP
+                        currency_ := xrec_.currency_code;
+                      END LOOP;
+                      v_str_aux := RTRIM(v_str_aux);
+                      
+                      OPEN c_getCashAccount(v_company,
+                                            v_str_aux,
+                                            currency_);
+                      
+                      FETCH c_getCashAccount INTO v_aux_cash_acc_;
+                      CLOSE c_getCashAccount;
+                      
+                      v_str_aux := v_aux_cash_acc_;
+                      IF (v_str_aux IS NULL) THEN
+                        v_str_aux := 'NOT_FOUND';                        
+                      END IF;
+                      v_bank_account := v_str_aux;
+                    
+                    WHEN ':28' THEN
+                      -- Remove prefix
+                      v_str_aux := substr(v_row, 6, LENGTH(v_row) - 5);
+                    
+                      -- Get Bank Statement number
+                      v_bank_stmt_no := SUBSTR(v_str_aux,
+                                               0,
+                                               INSTR(v_str_aux, '/') - 1);
+                    
+                      -- Get Bank statement file no
+                      v_bank_stmt_file_no := SUBSTR(v_str_aux,
+                                                    INSTR(v_str_aux, '/') + 1,
+                                                    LENGTH(v_str_aux));
+                    
+                    WHEN ':60' THEN
+                      -- Get opening balance
+                      v_str_aux := (CASE
+                                     WHEN regexp_substr(v_row, '[0-9]+,[0-9]+') IS NULL THEN
+                                      SUBSTR(regexp_substr(v_row, '[A-Z][A-Z][A-Z][0-9]+'), 4, 299999999)
+                                     ELSE
+                                      regexp_substr(v_row, '[0-9]+,[0-9]+')
+                                   END);
+                     
+                     IF (v_opening_balance IS NULL AND v_60F_found = FALSE) THEN
+                        v_opening_balance := TO_NUMBER(REPLACE(v_str_aux,
+                                                               ',',
+                                                               '.'));
+                      end if;
+                      
+                      IF (SUBSTR(v_row, 6, 1) = 'D') THEN
+                        v_opening_balance := 0 - v_opening_balance;
+                      END IF;
+                    
+                      -- Check if it is F or M (Final or Middle)
+                      IF (SUBSTR(v_row, 4, 1) = 'F') THEN
+                        v_60F_found := true;
+                      END IF;
+                      
+                      -- Get Detail trx date YY
+                      local_trans_date_mmdd_ := SUBSTR(v_row, 7, 2);
+                      
+                    WHEN ':61' THEN
+                      IF v_closing_balance IS NULL THEN -- transactions falls after the Closing Balance will not be fetched.
+                        v_cnt_61_ := v_cnt_61_ + 1;
+                        
+                        v_row := CASE
+                                   WHEN regexp_substr(v_row, '[0-9]+,[0-9]+') IS NULL THEN
+                                    regexp_replace(v_row, '(,)', ',00')
+                                   ELSE
+                                    v_row
+                                 END;
+                       
+                      IF (regexp_substr(v_row, '[0-9]+,[0-9]+') IS NULL) THEN
+                        
+                          v_str_aux := regexp_substr(regexp_substr(v_row,
+                                                                   '[CD][0-9]+,[0-9]+|
+                                                                   [CD][0-9]+,|
+                                                                   [CD][[0-9]+|
+                                                                   [CD][R][0-9]+,|
+                                                                   [CD][R][0-9]+,[0-9]+|
+                                                                   [CD][R][[0-9]+|
+                                                                   [C][P][0-9]+,|
+                                                                   [C][P][0-9]+,[0-9]+|
+                                                                   [C][P][[0-9]+ |
+                                                                   [RC][0-9]+,[0-9]+|
+                                                                   [RC][0-9]+,|
+                                                                   [RC]][[0-9]+|
+                                                                   [RD][0-9]+,[0-9]+|
+                                                                   [RD][0-9]+,|
+                                                                   [RD]][[0-9]+'), -- José - Adicionado RC/RD no regexp
+                                                     '[0-9]+,[0-9]+|[0-9]+');
+                        ELSE
+                          v_str_aux := regexp_substr(v_row, '[0-9]+,[0-9]+');
+                        END IF;
+                        
+                        v_ncom_position_ := REGEXP_INSTR(v_row,v_str_aux, 1, 1, 0, 'i');
+                        
+                        IF ((SUBSTR(v_row, (v_ncom_position_ + LENGTH(v_str_aux)), 4) = 'NCOM') 
+                            OR (SUBSTR(v_row, (v_ncom_position_ + LENGTH(v_str_aux) + 1), 4) = 'NCOM')) THEN
+                          v_trans_info_9_array(v_cnt_61_) := 'NCOM';
+                        END IF;
+                        
+                        v_trx_amount_array(v_cnt_61_) := TO_NUMBER(REPLACE(v_str_aux, ',', '.'));
+                        
+                        IF (SUBSTR(v_row, 11, 1) = 'D' ) THEN
+                          v_trx_amount_array(v_cnt_61_) := 0 - v_trx_amount_array(v_cnt_61_);                       
+                          v_str_aux := SUBSTR(v_row, 5, 6);
+                          v_trx_date_array(v_cnt_61_) := TO_DATE(v_str_aux, 'YYMMDD');
+                          
+                        ELSIF (SUBSTR(v_row, 11, 1) = 'C'  ) THEN                        
+                          v_str_aux := SUBSTR(v_row, 5, 6);
+                          v_trx_date_array(v_cnt_61_) := TO_DATE(v_str_aux,
+                                                                 'YYMMDD');
+                          
+                        ELSIF (SUBSTR(v_row, 15, 1) = 'D' OR SUBSTR(v_row, 15, 2) = 'RC') THEN               -- José - Adicionado RC na condição para Debito
+                          --Optional entry Date
+                          v_trx_amount_array(v_cnt_61_) := 0 - v_trx_amount_array(v_cnt_61_);
+                          
+                          -- Get Detail trx date MMDD
+                          v_str_aux                     := SUBSTR(v_row, 11, 4);                        
+                          local_trans_date_mmdd_        := SUBSTR(v_row, 5, 2);                        
+                          v_trx_date_array(v_cnt_61_)   := TO_DATE(local_trans_date_mmdd_ || v_str_aux, 'YYMMDD');
+                          
+                        ELSIF (SUBSTR(v_row, 15, 1) = 'C' OR SUBSTR(v_row, 15, 2) = 'RD') THEN               -- José - Adicionado RD na condição para Credito
+                          --Optional entry Date                        
+                          v_str_aux                    := SUBSTR(v_row, 11, 4);
+                          local_trans_date_mmdd_       := SUBSTR(v_row, 5, 2);
+                          v_trx_date_array(v_cnt_61_)  := TO_DATE(local_trans_date_mmdd_ || v_str_aux, 'YYMMDD');
+                        END IF;
+                      
+                        -- Check if the next row is info to add to the transaction or not
+                        -- Move to next line
+                        UTL_FILE.GET_LINE(v_file, v_row);
+                      
+                        IF (substr(v_row, 0, 1) <> ':') THEN
+                          -- Get Trans Info 8
+                          v_trans_info_8_array(v_cnt_61_) := v_row;
+                        ELSE
+                          -- Set default empty
+                          v_trans_info_8_array(v_cnt_61_) := '';
+                        
+                          -- Don't move to the next line in the following loop
+                          v_get_line := false;
+                        END IF;
+                      END IF; 
+                    
+                    WHEN ':62' THEN
+                      -- Get Closing balance
+                      v_str_aux         := (CASE
+                                             WHEN regexp_substr(v_row, '[0-9]+,[0-9]+') IS NULL THEN
+                                              SUBSTR(regexp_substr(v_row, '[A-Z][A-Z][A-Z][0-9]+'), 4, 299999999)
+                                             ELSE
+                                              regexp_substr(v_row, '[0-9]+,[0-9]+')
+                                           END);
+                      v_closing_balance := TO_NUMBER(REPLACE(v_str_aux,
+                                                             ',',
+                                                             '.'));
+                      IF (SUBSTR(v_row, 6, 1) = 'D') THEN
+                        v_closing_balance := 0 - v_closing_balance;
+                      END IF;
+                    
+                      -- Check if it is F or M (Final or Middle)
+                      IF (SUBSTR(v_row, 4, 1) = 'F') THEN
+                        v_62F_found := true;
+                      END IF;
+                    
+                      -- Get Statement date
+                      v_str_aux   := SUBSTR(v_row, 7, 6);
+                      v_stmt_date := TO_DATE(v_str_aux, 'YYMMDD');
+                    
+                      -- Get Currency code
+                      v_currency_code := SUBSTR(v_row, 13, 3);
+                    WHEN ':86' THEN
+                      -- alterar linha 86 bank statment 1843852 Get Trans Info 2
+                      IF v_closing_balance IS NULL THEN -- additional info falls after the Closing Balance will not be fetched.
+                        v_cnt_86_ := v_cnt_86_ + 1;
+                      
+                        IF v_cnt_86_ != v_cnt_61_ THEN
+                          IF v_cnt_61_ < v_cnt_86_ THEN
+                            v_cnt_61_ := v_cnt_86_;
+                          ELSE
+                            v_cnt_86_ := v_cnt_61_;
+                          END IF;
+                        END IF;
+                      
+                        v_trans_info_2_array(v_cnt_86_) := substr(v_row,
+                                                                  5,
+                                                                  LENGTH(v_row) - 4);
+                        -- Move to next line
+                        UTL_FILE.GET_LINE(v_file, v_row);
+                      
+                        -- Is it an extension of line :86, then 1st character is distinct of ':'
+                        IF (substr(v_row, 0, 1) NOT IN (':', '-')) THEN
+                          -- Get Trans Info 3
+                          v_trans_info_3_array(v_cnt_86_) := v_row;
+                        
+                          -- Get Payment Order and Payment order line
+                          v_str_aux                                := SUBSTR(v_row, 7, LENGTH(v_row) - 6);
+                          v_payment_order_array(v_cnt_86_)         := SUBSTR(v_str_aux, 0, INSTR(v_str_aux, '/') - 1); 
+                          v_str_aux                                := SUBSTR (v_str_aux, INSTR(v_str_aux, '/') + 1, LENGTH(v_str_aux)); 
+                          v_payment_order_lineno_array(v_cnt_86_)  := SUBSTR(v_str_aux,INSTR(v_str_aux,'/')+1,LENGTH(v_str_aux));
+                        
+                          -- Get supplier
+                          v_str_aux := null;
+                          OPEN c_getSupplierFromPayOrder(v_company, v_payment_order_array(v_cnt_86_), v_payment_order_lineno_array(v_cnt_86_));
+                          FETCH c_getSupplierFromPayOrder INTO v_str_aux;
+                          CLOSE c_getSupplierFromPayOrder;
+                          
+                          v_supplier_array(v_cnt_86_) := v_str_aux;
+                        
+                          -- Move to next line
+                          UTL_FILE.GET_LINE(v_file, v_row);
+                        
+                          IF (substr(v_row, 0, 1) NOT IN (':', '-')) THEN
+                            -- Get Trans Info 4
+                            v_trans_info_4_array(v_cnt_86_) := v_row;
+                          
+                            -- Move to next line
+                            UTL_FILE.GET_LINE(v_file, v_row);
+                          
+                            IF (substr(v_row, 0, 1) NOT IN (':', '-')) THEN
+                              -- Get Trans Info 5
+                              v_trans_info_5_array(v_cnt_86_) := v_row;
+                            
+                              -- Move to next line
+                              UTL_FILE.GET_LINE(v_file, v_row);
+                              IF (substr(v_row, 0, 1) NOT IN (':', '-')) THEN
+                                -- Get Trans Info 6
+                                v_trans_info_6_array(v_cnt_86_) := v_row;
+                              ELSE
+                                v_trans_info_6_array(v_cnt_86_) := '';
+                              
+                                -- Don't move to the next line in the following loop
+                                v_get_line := false;
+                              END IF;
+                            ELSE
+                              v_trans_info_5_array(v_cnt_86_) := '';
+                              v_trans_info_6_array(v_cnt_86_) := '';
+                            
+                              -- Don't move to the next line in the following loop
+                              v_get_line := false;
+                            END IF;
+                          ELSE
+                            v_trans_info_4_array(v_cnt_86_) := '';
+                            v_trans_info_5_array(v_cnt_86_) := '';
+                            v_trans_info_6_array(v_cnt_86_) := '';
+                          
+                            -- Don't move to the next line in the following loop
+                            v_get_line := false;
+                          END IF;
+                        
+                        ELSE
+                          -- Set default empty
+                          v_trans_info_3_array(v_cnt_86_)         := 'Additional line for :86 is not found';
+                          v_payment_order_array(v_cnt_86_)        := 'notfound';
+                          v_payment_order_lineno_array(v_cnt_86_) := 'notfound';
+                          v_supplier_array(v_cnt_86_)             := '';
+                          v_trans_info_4_array(v_cnt_86_)         := '';
+                          v_trans_info_5_array(v_cnt_86_)         := '';
+                          v_trans_info_6_array(v_cnt_86_)         := '';
+                        
+                          -- Don't move to the next line in the following loop
+                          v_get_line := false;
+                        END IF;
+                      END IF; 
+                    ELSE
+                      null;
+                  END CASE;
+                
+                EXCEPTION
+                  WHEN NO_DATA_FOUND THEN
+                    EXIT;
+                  WHEN OTHERS THEN
+                    RAISE;
+                END;
+              
+              END LOOP;
+            
+              -- ---------------------------------------------
+              -- Show results
+              writelog('   v_bank_account: ' || v_bank_account ||
+                       ' v_opening_balance: ' || v_opening_balance ||
+                       ' v_closing_balance: ' || v_closing_balance ||
+                       ' v_stmt_date: ' ||
+                       TO_CHAR(v_stmt_date, 'YYYY-MM-DD') ||
+                       ' v_currency_code: ' || v_currency_code ||
+                       ' v_bank_stmt_no: ' || v_bank_stmt_no ||
+                       ' Transactions: ' || v_cnt_61_);
+            
+              -- -----------------------------------------------------------
+              -- Call to create load ext file and process it
+              -- --------------------------------------------------------------
+              -- Only if there are transactions, or
+              if ((v_60f_found AND v_62f_found AND v_cnt_61_ > 0) OR
+                 (NOT (v_60f_found) OR NOT (v_62f_found))) THEN
+                create_load_ext_file(v_bank_account,
+                                     v_company,
+                                     v_closing_balance,
+                                     v_stmt_date,
+                                     v_currency_code,
+                                     v_opening_balance,
+                                     v_cnt_61_,
+                                     v_trx_amount_array,
+                                     v_trx_date_array,
+                                     v_supplier_array,
+                                     v_filename,
+                                     v_60f_found,
+                                     v_62f_found,
+                                     v_bank_stmt_no,
+                                     v_bank_stmt_file_no,
+                                     v_trans_info_2_array,
+                                     v_trans_info_3_array,
+                                     v_trans_info_4_array,
+                                     v_trans_info_5_array,
+                                     v_trans_info_6_array,
+                                     v_trans_info_8_array,
+                                     v_trans_info_9_array);
+              END IF;
+            
+              -- !!!Finally close the file
+              UTL_FILE.FCLOSE(v_file);
+            ELSE
+              v_commentsOperation := 'File could not be opened.';
+              v_successOperation  := 0;
+            END IF;
+          EXCEPTION
+            WHEN UTL_FILE.INVALID_OPERATION THEN
+              UTL_FILE.FCLOSE(v_file);
+              v_commentsOperation := 'File could not be opened or operated on as requested.';
+              v_successOperation  := 0;
+            WHEN UTL_FILE.invalid_path THEN
+              UTL_FILE.FCLOSE(v_file);
+              v_commentsOperation := 'UTL_FILE: An invalid path was give for the file.';
+              v_successOperation  := 0;
+            WHEN UTL_FILE.read_error THEN
+              UTL_FILE.FCLOSE(v_file);
+              v_commentsOperation := 'UTL_FILE: A read error occurred.';
+              v_successOperation  := 0;
+            WHEN OTHERS THEN
+              UTL_FILE.FCLOSE(v_file);
+              v_commentsOperation := 'other trouble: ' || SQLCODE ||
+                                     SQLERRM;
+              v_successOperation  := 0;
+              UTL_FILE.FCLOSE(v_file);
+          END;
+        
+          -- Move files to a specific path depending on operation result
+          IF (v_successOperation = 1) THEN
+          
+            UTL_FILE.FRENAME(v_dir_bank_stmt,
+                             v_filename,
+                             v_dir_ok_bank_stmt,
+                             v_filename,
+                             TRUE);
+            -- dbms_output.put_line(v_filename ||'-'||v_dir_bank_stmt ||'-'||v_successOperation);
+          /*ELSE
+            UTL_FILE.FRENAME(v_dir_bank_stmt,
+                             v_filename,
+                             v_dir_error_bank_stmt,
+                             v_filename,
+                             TRUE);*/
+            -- dbms_output.put_line(v_filename ||'-'||v_dir_error_bank_stmt||'-'||v_successOperation);
+          END IF;
+          -- UTL_FILE.FOPEN(v_dir_bank_stmt, v_filename, 'R');
+        
+          writelog(NVL(v_commentsOperation, v_row), i_, v_filename);
+        
+          -- Step
+          v_file_list := SUBSTR(v_file_list,
+                                INSTR(v_file_list, '||') + 2,
+                                LENGTH(v_file_list));
+        END LOOP;
+      
+      END IF;
+    ELSE
+      error_sys.appl_general('C_BANK_STATEMENT_INT_API',
+                             ' Directory alias BANK_STATEMENTS_DIR not defined!');
+    END IF;
+  
+  END start_process;
+
+  -----------------------------------------------------------------------------
+  -------------------- FOUNDATION1 METHODS ------------------------------------
+  -----------------------------------------------------------------------------
+
+  PROCEDURE init IS
+  BEGIN
+    NULL;
+  END init;
+
+END C_BANK_STATEMENT_INT_API;
